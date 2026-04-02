@@ -15,6 +15,7 @@ import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.address.GlobalNamespace;
+import ghidra.program.model.data.*;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryAccessException;
@@ -35,8 +36,10 @@ import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.net.URLDecoder;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 
 @PluginInfo(
@@ -176,6 +179,46 @@ public class GhidraMCPPlugin extends Plugin {
 			} catch (MemoryAccessException e) {
 				throw new RuntimeException(e);
 			}
+		});
+
+		server.createContext("/types", exchange -> {
+			Map<String, String> qparams = parseQueryParams(exchange);
+			int offset = parseIntOrDefault(qparams.get("offset"), 0);
+			int limit = parseIntOrDefault(qparams.get("limit"), 100);
+			String kind = qparams.get("kind");
+			String query = qparams.get("query");
+			sendResponse(exchange, listDataTypes(offset, limit, kind, query));
+		});
+
+		server.createContext("/type", exchange -> {
+			Map<String, String> qparams = parseQueryParams(exchange);
+			sendResponse(exchange, getDataTypeDetails(qparams.get("name")));
+		});
+
+		server.createContext("/renameDataType", exchange -> {
+			Map<String, String> params = parsePostParams(exchange);
+			String response = renameDataType(params.get("oldName"), params.get("newName"));
+			sendResponse(exchange, response);
+		});
+
+		server.createContext("/createStructure", exchange -> {
+			Map<String, String> params = parsePostParams(exchange);
+			String response = createStructure(params.get("name"),
+				parseIntOrDefault(params.get("size"), 0),
+				params.get("categoryPath"));
+			sendResponse(exchange, response);
+		});
+
+		server.createContext("/setStructureField", exchange -> {
+			Map<String, String> params = parsePostParams(exchange);
+			String response = setStructureField(
+				params.get("structName"),
+				parseIntOrDefault(params.get("offset"), 0),
+				params.get("fieldType"),
+				params.get("fieldName"),
+				params.get("comment")
+			);
+			sendResponse(exchange, response);
 		});
 
 		server.createContext("/searchFunctions", exchange -> {
@@ -427,6 +470,283 @@ public class GhidraMCPPlugin extends Plugin {
 		return paginateList(matches, offset, limit);
 	}
 
+	private String listDataTypes(int offset, int limit, String kind, String query) {
+		Program program = getCurrentProgram();
+		if (program == null) return "No program loaded";
+
+		String normalizedKind = kind == null ? "all" : kind.toLowerCase(Locale.ROOT);
+		String normalizedQuery = query == null ? "" : query.toLowerCase(Locale.ROOT);
+		List<Map<String, Object>> rows = new ArrayList<>();
+
+		Iterator<DataType> allDataTypes = program.getDataTypeManager().getAllDataTypes();
+		while (allDataTypes.hasNext()) {
+			DataType dataType = allDataTypes.next();
+			if (!matchesDataTypeKind(dataType, normalizedKind)) {
+				continue;
+			}
+			String name = dataType.getName();
+			String path = dataType.getPathName();
+			if (!normalizedQuery.isEmpty() &&
+				!name.toLowerCase(Locale.ROOT).contains(normalizedQuery) &&
+				!path.toLowerCase(Locale.ROOT).contains(normalizedQuery)) {
+				continue;
+			}
+			rows.add(summarizeDataType(dataType));
+		}
+
+		rows.sort(Comparator.comparing(row -> (String) row.get("path"), String.CASE_INSENSITIVE_ORDER));
+		int start = Math.max(0, offset);
+		int end = Math.min(rows.size(), start + Math.max(0, limit));
+		if (start >= rows.size()) {
+			return "[]";
+		}
+		return gson.toJson(rows.subList(start, end));
+	}
+
+	private String getDataTypeDetails(String name) {
+		Program program = getCurrentProgram();
+		if (program == null) return "No program loaded";
+		if (name == null || name.isBlank()) return "Type name is required";
+
+		DataType dataType = findDataTypeByName(program, name);
+		if (dataType == null) {
+			return "Data type not found";
+		}
+		return gson.toJson(describeDataType(dataType));
+	}
+
+	private String renameDataType(String oldName, String newName) {
+		Program program = getCurrentProgram();
+		if (program == null) return "No program loaded";
+		if (oldName == null || oldName.isBlank() || newName == null || newName.isBlank()) {
+			return "Type names are required";
+		}
+
+		AtomicReference<String> result = new AtomicReference<>("Rename failed");
+		try {
+			SwingUtilities.invokeAndWait(() -> {
+				int tx = program.startTransaction("Rename data type via HTTP");
+				boolean success = false;
+				try {
+					DataType dataType = findDataTypeByName(program, oldName);
+					if (dataType == null) {
+						result.set("Data type not found");
+						return;
+					}
+					dataType.setName(newName);
+					result.set("Renamed successfully");
+					success = true;
+				} catch (Exception e) {
+					Msg.error(this, "Error renaming data type", e);
+					result.set("Error: " + e.getMessage());
+				} finally {
+					program.endTransaction(tx, success);
+				}
+			});
+		} catch (InterruptedException | InvocationTargetException e) {
+			Msg.error(this, "Failed to execute data type rename on Swing thread", e);
+			return "Error: " + e.getMessage();
+		}
+		return result.get();
+	}
+
+	private String createStructure(String name, int size, String categoryPath) {
+		Program program = getCurrentProgram();
+		if (program == null) return "No program loaded";
+		if (name == null || name.isBlank()) return "Structure name is required";
+
+		AtomicReference<String> result = new AtomicReference<>("Create failed");
+		try {
+			SwingUtilities.invokeAndWait(() -> {
+				int tx = program.startTransaction("Create structure via HTTP");
+				boolean success = false;
+				try {
+					CategoryPath path = normalizeCategoryPath(categoryPath);
+					StructureDataType newStructure = new StructureDataType(path, name, Math.max(size, 0));
+					DataType resolved = program.getDataTypeManager().addDataType(newStructure,
+						DataTypeConflictHandler.DEFAULT_HANDLER);
+					result.set(gson.toJson(describeDataType(resolved)));
+					success = true;
+				} catch (Exception e) {
+					Msg.error(this, "Error creating structure", e);
+					result.set("Error: " + e.getMessage());
+				} finally {
+					program.endTransaction(tx, success);
+				}
+			});
+		} catch (InterruptedException | InvocationTargetException e) {
+			Msg.error(this, "Failed to execute create structure on Swing thread", e);
+			return "Error: " + e.getMessage();
+		}
+		return result.get();
+	}
+
+	private String setStructureField(String structName, int offset, String fieldTypeName, String fieldName,
+			String comment) {
+		Program program = getCurrentProgram();
+		if (program == null) return "No program loaded";
+		if (structName == null || structName.isBlank()) return "Structure name is required";
+		if (fieldTypeName == null || fieldTypeName.isBlank()) return "Field type is required";
+
+		AtomicReference<String> result = new AtomicReference<>("Field update failed");
+		try {
+			SwingUtilities.invokeAndWait(() -> {
+				int tx = program.startTransaction("Set structure field via HTTP");
+				boolean success = false;
+				try {
+					DataType structType = findDataTypeByName(program, structName);
+					if (!(structType instanceof Structure structure)) {
+						result.set("Structure not found");
+						return;
+					}
+					DataType fieldType = findDataTypeByName(program, fieldTypeName);
+					if (fieldType == null) {
+						result.set("Field type not found");
+						return;
+					}
+					if (structure.isPackingEnabled()) {
+						result.set("Packed structures are not supported");
+						return;
+					}
+					String normalizedFieldName = fieldName == null || fieldName.isBlank() ? null : fieldName;
+					String normalizedComment = comment == null || comment.isBlank() ? null : comment;
+					int length = fieldType.getLength() > 0 ? fieldType.getLength() : -1;
+					if (structure.isZeroLength() || offset >= structure.getLength()) {
+						structure.insertAtOffset(offset, fieldType, length, normalizedFieldName, normalizedComment);
+					} else {
+						int fieldLength = Math.max(fieldType.getLength(), 1);
+						int roomForData = structure.getLength() - (offset + fieldLength);
+						if (roomForData < 0) {
+							structure.growStructure(-roomForData);
+						}
+						structure.replaceAtOffset(offset, fieldType, length, normalizedFieldName, normalizedComment);
+					}
+					result.set(gson.toJson(describeDataType(structure)));
+					success = true;
+				} catch (Exception e) {
+					Msg.error(this, "Error updating structure field", e);
+					result.set("Error: " + e.getMessage());
+				} finally {
+					program.endTransaction(tx, success);
+				}
+			});
+		} catch (InterruptedException | InvocationTargetException e) {
+			Msg.error(this, "Failed to execute structure field update on Swing thread", e);
+			return "Error: " + e.getMessage();
+		}
+		return result.get();
+	}
+
+	private boolean matchesDataTypeKind(DataType dataType, String kind) {
+		if (kind == null || kind.isEmpty() || "all".equals(kind)) {
+			return true;
+		}
+		return switch (kind) {
+			case "structure" -> dataType instanceof Structure;
+			case "union" -> dataType instanceof Union;
+			case "enum" -> dataType instanceof ghidra.program.model.data.Enum;
+			case "typedef" -> dataType instanceof TypeDef;
+			case "pointer" -> dataType instanceof Pointer;
+			case "array" -> dataType instanceof Array;
+			case "composite" -> dataType instanceof Composite;
+			case "builtin" -> dataType.getDataTypeManager() instanceof BuiltInDataTypeManager;
+			default -> true;
+		};
+	}
+
+	private Map<String, Object> summarizeDataType(DataType dataType) {
+		Map<String, Object> row = new LinkedHashMap<>();
+		row.put("name", dataType.getName());
+		row.put("path", dataType.getPathName());
+		row.put("categoryPath", dataType.getCategoryPath().getPath());
+		row.put("kind", classifyDataType(dataType));
+		row.put("className", dataType.getClass().getSimpleName());
+		row.put("length", dataType.getLength());
+		return row;
+	}
+
+	private Map<String, Object> describeDataType(DataType dataType) {
+		Map<String, Object> row = summarizeDataType(dataType);
+		if (dataType instanceof TypeDef typeDef) {
+			row.put("baseType", typeDef.getBaseDataType().getPathName());
+		}
+		if (dataType instanceof Pointer pointer && pointer.getDataType() != null) {
+			row.put("pointsTo", pointer.getDataType().getPathName());
+		}
+		if (dataType instanceof Array array) {
+			row.put("elementType", array.getDataType().getPathName());
+			row.put("elementLength", array.getElementLength());
+			row.put("numElements", array.getNumElements());
+		}
+		if (dataType instanceof Structure structure) {
+			List<Map<String, Object>> components = new ArrayList<>();
+			for (DataTypeComponent component : structure.getDefinedComponents()) {
+				Map<String, Object> c = new LinkedHashMap<>();
+				c.put("ordinal", component.getOrdinal());
+				c.put("offset", component.getOffset());
+				c.put("length", component.getLength());
+				c.put("fieldName", component.getFieldName());
+				c.put("comment", component.getComment());
+				c.put("dataType", component.getDataType().getPathName());
+				components.add(c);
+			}
+			row.put("components", components);
+			row.put("packingEnabled", structure.isPackingEnabled());
+		}
+		if (dataType instanceof Union union) {
+			List<Map<String, Object>> components = new ArrayList<>();
+			for (DataTypeComponent component : union.getDefinedComponents()) {
+				Map<String, Object> c = new LinkedHashMap<>();
+				c.put("ordinal", component.getOrdinal());
+				c.put("offset", component.getOffset());
+				c.put("length", component.getLength());
+				c.put("fieldName", component.getFieldName());
+				c.put("comment", component.getComment());
+				c.put("dataType", component.getDataType().getPathName());
+				components.add(c);
+			}
+			row.put("components", components);
+		}
+		return row;
+	}
+
+	private String classifyDataType(DataType dataType) {
+		if (dataType instanceof Structure) return "structure";
+		if (dataType instanceof Union) return "union";
+		if (dataType instanceof ghidra.program.model.data.Enum) return "enum";
+		if (dataType instanceof TypeDef) return "typedef";
+		if (dataType instanceof Pointer) return "pointer";
+		if (dataType instanceof Array) return "array";
+		if (dataType instanceof Composite) return "composite";
+		return "datatype";
+	}
+
+	private CategoryPath normalizeCategoryPath(String categoryPath) {
+		if (categoryPath == null || categoryPath.isBlank() || "/".equals(categoryPath)) {
+			return CategoryPath.ROOT;
+		}
+		return categoryPath.startsWith("/") ? new CategoryPath(categoryPath) : new CategoryPath("/" + categoryPath);
+	}
+
+	private DataType findDataTypeByName(Program program, String name) {
+		if (name == null || name.isBlank()) {
+			return null;
+		}
+		DataTypeManager dataTypeManager = program.getDataTypeManager();
+		Iterator<DataType> allDataTypes = dataTypeManager.getAllDataTypes();
+		DataType nameMatch = null;
+		while (allDataTypes.hasNext()) {
+			DataType dataType = allDataTypes.next();
+			if (name.equals(dataType.getPathName())) {
+				return dataType;
+			}
+			if (name.equals(dataType.getName()) && nameMatch == null) {
+				nameMatch = dataType;
+			}
+		}
+		return nameMatch;
+	}
+
 	// ----------------------------------------------------------------------------------
 	// Logic for rename, decompile, etc.
 	// ----------------------------------------------------------------------------------
@@ -642,13 +962,15 @@ public class GhidraMCPPlugin extends Plugin {
 	 */
 	private Map<String, String> parseQueryParams(HttpExchange exchange) {
 		Map<String, String> result = new HashMap<>();
-		String query = exchange.getRequestURI().getQuery(); // e.g. offset=10&limit=100
+		String query = exchange.getRequestURI().getRawQuery(); // preserve encoded characters for explicit decoding
 		if (query != null) {
 			String[] pairs = query.split("&");
 			for (String p : pairs) {
-				String[] kv = p.split("=");
+				String[] kv = p.split("=", 2);
 				if (kv.length == 2) {
-					result.put(kv[0], kv[1]);
+					String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
+					String value = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+					result.put(key, value);
 				}
 			}
 		}
@@ -663,9 +985,11 @@ public class GhidraMCPPlugin extends Plugin {
 		String bodyStr = new String(body, StandardCharsets.UTF_8);
 		Map<String, String> params = new HashMap<>();
 		for (String pair : bodyStr.split("&")) {
-			String[] kv = pair.split("=");
+			String[] kv = pair.split("=", 2);
 			if (kv.length == 2) {
-				params.put(kv[0], kv[1]);
+				String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
+				String value = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+				params.put(key, value);
 			}
 		}
 		return params;

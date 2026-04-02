@@ -34,6 +34,11 @@ ENDPOINTS = {
     "exports": "exports",
     "namespaces": "namespaces",
     "data": "data",
+    "types": "types",
+    "type": "type",
+    "rename_data_type": "renameDataType",
+    "create_structure": "createStructure",
+    "set_structure_field": "setStructureField",
     "search_functions": "searchFunctions",
 }
 
@@ -150,6 +155,56 @@ def list_data_items(offset: int = 0, limit: int = 100, bytesourceoffset: bool = 
         "offset": offset,
         "limit": limit,
         "bytesourceoffset": str(bytesourceoffset).lower(),
+    })
+
+@mcp.tool()
+def list_data_types(offset: int = 0, limit: int = 100, kind: str = "all", query: str = "") -> str:
+    """
+    List program data types and structures. Optional filters: kind=all|structure|union|enum|typedef|pointer|array|composite|builtin.
+    """
+    return "\n".join(safe_get(ENDPOINTS["types"], {
+        "offset": offset,
+        "limit": limit,
+        "kind": kind,
+        "query": query,
+    }))
+
+@mcp.tool()
+def get_data_type(name: str) -> str:
+    """
+    Get detailed information about a specific data type or structure by name or full path.
+    """
+    return "\n".join(safe_get(ENDPOINTS["type"], {"name": name}))
+
+@mcp.tool()
+def rename_data_type(old_name: str, new_name: str) -> str:
+    """
+    Rename a data type by its current name or full path.
+    """
+    return safe_post(ENDPOINTS["rename_data_type"], {"oldName": old_name, "newName": new_name})
+
+@mcp.tool()
+def create_structure(name: str, size: int = 0, category_path: str = "/") -> str:
+    """
+    Create a new structure in the program data type manager.
+    """
+    return safe_post(ENDPOINTS["create_structure"], {
+        "name": name,
+        "size": size,
+        "categoryPath": category_path,
+    })
+
+@mcp.tool()
+def set_structure_field(struct_name: str, offset: int, field_type: str, field_name: str = "", comment: str = "") -> str:
+    """
+    Insert or replace a field in a non-packed structure at the given offset.
+    """
+    return safe_post(ENDPOINTS["set_structure_field"], {
+        "structName": struct_name,
+        "offset": offset,
+        "fieldType": field_type,
+        "fieldName": field_name,
+        "comment": comment,
     })
 
 @mcp.tool()
