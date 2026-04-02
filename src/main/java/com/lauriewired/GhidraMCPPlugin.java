@@ -101,10 +101,15 @@ public class GhidraMCPPlugin extends Plugin {
 		});
 
 		server.createContext("/fun", exchange -> {
-			Map<String, String> qparams = parseQueryParams(exchange);
-			var name = qparams.get("name");
-
-			sendResponse(exchange, gson.toJson(getFunction(name)));
+			try {
+				Map<String, String> qparams = parseQueryParams(exchange);
+				var name = qparams.get("name");
+				sendResponse(exchange, gson.toJson(getFunction(name)));
+			}
+			catch (Exception e) {
+				Msg.error(this, "Failed to handle /fun request", e);
+				sendErrorResponse(exchange, 500, "Failed to read function details: " + e.getMessage());
+			}
 		});
 
 		server.createContext("/classes", exchange -> {
@@ -258,7 +263,9 @@ public class GhidraMCPPlugin extends Plugin {
 
 	private Fun getFunction(String name) {
 		Program program = getCurrentProgram();
-		//if (program == null) return ["No program loaded"];
+		if (program == null || name == null || name.isBlank()) {
+			return null;
+		}
 
 		List<FunctionCall> calls = new ArrayList<>();
 
@@ -276,8 +283,13 @@ public class GhidraMCPPlugin extends Plugin {
 
 				Map<String, String> argRegs = new LinkedHashMap<>();
 
-				for (var param : parameters)
-					argRegs.put(param.getRegister().getName(), param.getName());
+				for (var param : parameters) {
+					Register register = param.getRegister();
+					if (register == null) {
+						continue;
+					}
+					argRegs.put(register.getName().toUpperCase(), param.getName());
+				}
 				// Get all references to this function
 				for (Reference ref : rm.getReferencesTo(entry)) {
 					Address callAddr = ref.getFromAddress();
@@ -296,9 +308,12 @@ public class GhidraMCPPlugin extends Plugin {
 
 					Instruction prev = instr.getPrevious();
 					while (prev != null && stepsBack < 10) {
-						if (prev.getNumOperands() >= 2 && prev.getOpObjects(0)[0] instanceof Register && prev.getOpObjects(1)[0] instanceof Scalar) {
-							Register reg = (Register) prev.getOpObjects(0)[0];
-							Scalar val = (Scalar) prev.getOpObjects(1)[0];
+						Object[] dstObjects = prev.getNumOperands() >= 1 ? prev.getOpObjects(0) : new Object[0];
+						Object[] srcObjects = prev.getNumOperands() >= 2 ? prev.getOpObjects(1) : new Object[0];
+						if (dstObjects.length > 0 && srcObjects.length > 0 &&
+							dstObjects[0] instanceof Register && srcObjects[0] instanceof Scalar) {
+							Register reg = (Register) dstObjects[0];
+							Scalar val = (Scalar) srcObjects[0];
 							String regName = reg.getName().toUpperCase();
 							if (argRegs.containsKey(regName) && !seenArgs.containsKey(regName)) {
 								seenArgs.put(argRegs.get(regName), val.getValue());
@@ -322,6 +337,14 @@ public class GhidraMCPPlugin extends Plugin {
 			}
 		}
 		return null;
+	}
+
+	private void sendErrorResponse(HttpExchange exchange, int statusCode, String response) throws IOException {
+		byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+		exchange.sendResponseHeaders(statusCode, bytes.length);
+		try (OutputStream os = exchange.getResponseBody()) {
+			os.write(bytes);
+		}
 	}
 
 	private String getAllClassNames(int offset, int limit) {
