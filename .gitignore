@@ -1,3 +1,13 @@
+# Codex
+.codex
+
+# Gradle
+.gradle/
+build/
+
+# Python
+__pycache__/
+
 # Maven target directory
 /target/
 
