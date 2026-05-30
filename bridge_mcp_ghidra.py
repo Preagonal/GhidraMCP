@@ -24,8 +24,10 @@ ghidra_server_url = DEFAULT_GHIDRA_SERVER
 ENDPOINTS = {
     "methods": "methods",
     "fun": "fun",
+    "fun_address": "funAddress",
     "classes": "classes",
     "decompile": "decompile",
+    "decompile_address": "decompileAddress",
     "rename_function": "renameFunction",
     "rename_data": "renameData",
     "rename_variable": "renameVariable",
@@ -86,9 +88,16 @@ def list_methods(offset: int = 0, limit: int = 100) -> list:
 @mcp.tool()
 def get_function(name: str) -> str:
     """
-    Get detailed function metadata as returned by the Java /fun endpoint.
+    Get detailed function metadata (name, address, parameters, calls, pseudocode, and assembly) by name.
     """
     return "\n".join(safe_get(ENDPOINTS["fun"], {"name": name}))
+
+@mcp.tool()
+def get_function_by_address(address: str) -> str:
+    """
+    Get detailed function metadata (name, address, parameters, calls, pseudocode, and assembly) by address.
+    """
+    return "\n".join(safe_get(ENDPOINTS["fun_address"], {"address": address}))
 
 @mcp.tool()
 def list_classes(offset: int = 0, limit: int = 100) -> list:
@@ -103,6 +112,13 @@ def decompile_function(name: str) -> str:
     Decompile a specific function by name and return the decompiled C code.
     """
     return safe_post(ENDPOINTS["decompile"], name)
+
+@mcp.tool()
+def decompile_function_by_address(address: str) -> str:
+    """
+    Decompile a specific function by address and return the decompiled C code.
+    """
+    return safe_post(ENDPOINTS["decompile_address"], address)
 
 @mcp.tool()
 def rename_function(old_name: str, new_name: str) -> str:

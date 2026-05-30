@@ -112,6 +112,18 @@ public class GhidraMCPPlugin extends Plugin {
 			}
 		});
 
+		server.createContext("/funAddress", exchange -> {
+			try {
+				Map<String, String> qparams = parseQueryParams(exchange);
+				var address = qparams.get("address");
+				sendResponse(exchange, gson.toJson(getFunctionByAddress(address)));
+			}
+			catch (Exception e) {
+				Msg.error(this, "Failed to handle /funAddress request", e);
+				sendErrorResponse(exchange, 500, "Failed to read function details: " + e.getMessage());
+			}
+		});
+
 		server.createContext("/classes", exchange -> {
 			Map<String, String> qparams = parseQueryParams(exchange);
 			int offset = parseIntOrDefault(qparams.get("offset"), 0);
@@ -124,17 +136,21 @@ public class GhidraMCPPlugin extends Plugin {
 			sendResponse(exchange, decompileFunctionByName(name));
 		});
 
+		server.createContext("/decompileAddress", exchange -> {
+			String address = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+			sendResponse(exchange, decompileFunctionByAddress(address));
+		});
+
 		server.createContext("/renameFunction", exchange -> {
 			Map<String, String> params = parsePostParams(exchange);
-			String response = renameFunction(params.get("oldName"), params.get("newName"))
-				? "Renamed successfully" : "Rename failed";
+			String response = renameFunction(params.get("oldName"), params.get("newName"));
 			sendResponse(exchange, response);
 		});
 
 		server.createContext("/renameData", exchange -> {
 			Map<String, String> params = parsePostParams(exchange);
-			renameDataAtAddress(params.get("address"), params.get("newName"));
-			sendResponse(exchange, "Rename data attempted");
+			String response = renameDataAtAddress(params.get("address"), params.get("newName"));
+			sendResponse(exchange, response);
 		});
 
 		server.createContext("/renameVariable", exchange -> {
@@ -267,76 +283,121 @@ public class GhidraMCPPlugin extends Plugin {
 			return null;
 		}
 
-		List<FunctionCall> calls = new ArrayList<>();
-
 		FunctionManager fm = program.getFunctionManager();
-		SymbolTable st = program.getSymbolTable();
-		ReferenceManager rm = program.getReferenceManager();
-
-
-		var fun = new Fun();
 		for (Function f : fm.getFunctions(true)) {
 			if (Objects.equals(f.getName(true), name)) {
-				Address entry = f.getEntryPoint();
-				var parameters = f.getParameters();
-
-
-				Map<String, String> argRegs = new LinkedHashMap<>();
-
-				for (var param : parameters) {
-					Register register = param.getRegister();
-					if (register == null) {
-						continue;
-					}
-					argRegs.put(register.getName().toUpperCase(), param.getName());
-				}
-				// Get all references to this function
-				for (Reference ref : rm.getReferencesTo(entry)) {
-					Address callAddr = ref.getFromAddress();
-					Instruction instr = program.getListing().getInstructionAt(callAddr);
-					Function callingFunc = fm.getFunctionContaining(callAddr);
-
-					if (instr == null || callingFunc == null || !instr.getMnemonicString().equalsIgnoreCase("CALL"))
-						continue;
-
-					FunctionCall fc = new FunctionCall();
-					fc.callAddress = "0x%s".formatted(callAddr.toString());
-					fc.fromFunction = callingFunc.getName(true);
-
-					int stepsBack = 0;
-					Map<String, Long> seenArgs = new LinkedHashMap<>();
-
-					Instruction prev = instr.getPrevious();
-					while (prev != null && stepsBack < 10) {
-						Object[] dstObjects = prev.getNumOperands() >= 1 ? prev.getOpObjects(0) : new Object[0];
-						Object[] srcObjects = prev.getNumOperands() >= 2 ? prev.getOpObjects(1) : new Object[0];
-						if (dstObjects.length > 0 && srcObjects.length > 0 &&
-							dstObjects[0] instanceof Register && srcObjects[0] instanceof Scalar) {
-							Register reg = (Register) dstObjects[0];
-							Scalar val = (Scalar) srcObjects[0];
-							String regName = reg.getName().toUpperCase();
-							if (argRegs.containsKey(regName) && !seenArgs.containsKey(regName)) {
-								seenArgs.put(argRegs.get(regName), val.getValue());
-							}
-						}
-
-						prev = prev.getPrevious();
-						stepsBack++;
-					}
-
-					fc.parameters.putAll(seenArgs);
-
-					calls.add(fc);
-				}
-
-				fun.name = f.getName(true);
-				fun.address = "0x%s".formatted(f.getEntryPoint().toString());
-				fun.calls = calls;
-
-				return fun;
+				return getFunDetails(f);
 			}
 		}
 		return null;
+	}
+
+	private Fun getFunctionByAddress(String addressStr) {
+		Program program = getCurrentProgram();
+		if (program == null || addressStr == null || addressStr.isBlank()) {
+			return null;
+		}
+		Address addr = program.getAddressFactory().getAddress(addressStr);
+		if (addr == null) {
+			return null;
+		}
+		Function f = program.getFunctionManager().getFunctionContaining(addr);
+		return getFunDetails(f);
+	}
+
+	private Fun getFunDetails(Function f) {
+		if (f == null) {
+			return null;
+		}
+
+		Program program = getCurrentProgram();
+		FunctionManager fm = program.getFunctionManager();
+		ReferenceManager rm = program.getReferenceManager();
+
+		List<FunctionCall> calls = new ArrayList<>();
+		Address entry = f.getEntryPoint();
+		var parameters = f.getParameters();
+
+		Map<String, String> argRegs = new LinkedHashMap<>();
+
+		for (var param : parameters) {
+			Register register = param.getRegister();
+			if (register == null) {
+				continue;
+			}
+			argRegs.put(register.getName().toUpperCase(), param.getName());
+		}
+		// Get all references to this function
+		for (Reference ref : rm.getReferencesTo(entry)) {
+			Address callAddr = ref.getFromAddress();
+			Instruction instr = program.getListing().getInstructionAt(callAddr);
+			Function callingFunc = fm.getFunctionContaining(callAddr);
+
+			if (instr == null || callingFunc == null || !instr.getMnemonicString().equalsIgnoreCase("CALL"))
+				continue;
+
+			FunctionCall fc = new FunctionCall();
+			fc.callAddress = "0x%s".formatted(callAddr.toString());
+			fc.fromFunction = callingFunc.getName(true);
+
+			int stepsBack = 0;
+			Map<String, Long> seenArgs = new LinkedHashMap<>();
+
+			Instruction prev = instr.getPrevious();
+			while (prev != null && stepsBack < 10) {
+				Object[] dstObjects = prev.getNumOperands() >= 1 ? prev.getOpObjects(0) : new Object[0];
+				Object[] srcObjects = prev.getNumOperands() >= 2 ? prev.getOpObjects(1) : new Object[0];
+				if (dstObjects.length > 0 && srcObjects.length > 0 &&
+					dstObjects[0] instanceof Register && srcObjects[0] instanceof Scalar) {
+					Register reg = (Register) dstObjects[0];
+					Scalar val = (Scalar) srcObjects[0];
+					String regName = reg.getName().toUpperCase();
+					if (argRegs.containsKey(regName) && !seenArgs.containsKey(regName)) {
+						seenArgs.put(argRegs.get(regName), val.getValue());
+					}
+				}
+
+				prev = prev.getPrevious();
+				stepsBack++;
+			}
+
+			fc.parameters.putAll(seenArgs);
+
+			calls.add(fc);
+		}
+
+		// Collect assembly
+		StringBuilder assembly = new StringBuilder();
+		Listing listing = program.getListing();
+		InstructionIterator it = listing.getInstructions(f.getBody(), true);
+		while (it.hasNext()) {
+			Instruction instr = it.next();
+			assembly.append(instr.getAddress().toString()).append(": ").append(instr.toString()).append("\n");
+		}
+
+		// Collect pseudocode
+		String pseudocode = "";
+		DecompInterface decomp = new DecompInterface();
+		try {
+			decomp.openProgram(program);
+			DecompileResults result = decomp.decompileFunction(f, 30, new ConsoleTaskMonitor());
+			if (result != null && result.decompileCompleted()) {
+				pseudocode = result.getDecompiledFunction().getC();
+			} else {
+				pseudocode = "Decompilation failed";
+			}
+		} finally {
+			decomp.dispose();
+		}
+
+		var fun = new Fun();
+		fun.name = f.getName(true);
+		fun.address = "0x%s".formatted(f.getEntryPoint().toString());
+		fun.calls = calls;
+		fun.assembly = assembly.toString();
+		fun.pseudocode = pseudocode;
+
+		return fun;
 	}
 
 	private void sendErrorResponse(HttpExchange exchange, int statusCode, String response) throws IOException {
@@ -553,11 +614,11 @@ public class GhidraMCPPlugin extends Plugin {
 				try {
 					DataType dataType = findDataTypeByName(program, oldName);
 					if (dataType == null) {
-						result.set("Data type not found");
+						result.set("Data type '" + oldName + "' not found");
 						return;
 					}
 					dataType.setName(newName);
-					result.set("Renamed successfully");
+					result.set("Successfully renamed data type '" + oldName + "' to '" + newName + "'");
 					success = true;
 				} catch (Exception e) {
 					Msg.error(this, "Error renaming data type", e);
@@ -778,61 +839,102 @@ public class GhidraMCPPlugin extends Plugin {
 		Program program = getCurrentProgram();
 		if (program == null) return "No program loaded";
 		DecompInterface decomp = new DecompInterface();
-		decomp.openProgram(program);
-		for (Function func : program.getFunctionManager().getFunctions(true)) {
-			if (func.getName().equals(name)) {
-				DecompileResults result =
-					decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
-				if (result != null && result.decompileCompleted()) {
-					return result.getDecompiledFunction().getC();
-				} else {
-					return "Decompilation failed";
+		try {
+			decomp.openProgram(program);
+			for (Function func : program.getFunctionManager().getFunctions(true)) {
+				if (func.getName().equals(name)) {
+					DecompileResults result =
+						decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+					if (result != null && result.decompileCompleted()) {
+						return result.getDecompiledFunction().getC();
+					} else {
+						return "Decompilation failed";
+					}
 				}
 			}
+		} finally {
+			decomp.dispose();
 		}
 		return "Function not found";
 	}
 
-	private boolean renameFunction(String oldName, String newName) {
+	private String decompileFunctionByAddress(String addressStr) {
 		Program program = getCurrentProgram();
-		if (program == null) return false;
+		if (program == null) return "No program loaded";
+		Address addr = program.getAddressFactory().getAddress(addressStr);
+		if (addr == null) return "Invalid address";
+		Function func = program.getFunctionManager().getFunctionContaining(addr);
+		if (func == null) return "Function not found at address";
 
-		AtomicBoolean successFlag = new AtomicBoolean(false);
+		DecompInterface decomp = new DecompInterface();
+		try {
+			decomp.openProgram(program);
+			DecompileResults result = decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+			if (result != null && result.decompileCompleted()) {
+				return result.getDecompiledFunction().getC();
+			} else {
+				return "Decompilation failed";
+			}
+		} finally {
+			decomp.dispose();
+		}
+	}
+
+	private String renameFunction(String oldName, String newName) {
+		Program program = getCurrentProgram();
+		if (program == null) return "No program loaded";
+
+		AtomicReference<String> result = new AtomicReference<>("Rename failed");
 		try {
 			SwingUtilities.invokeAndWait(() -> {
 				int tx = program.startTransaction("Rename function via HTTP");
+				boolean success = false;
 				try {
 					for (Function func : program.getFunctionManager().getFunctions(true)) {
 						if (func.getName().equals(oldName)) {
+							String address = func.getEntryPoint().toString();
 							func.setName(newName, SourceType.USER_DEFINED);
-							successFlag.set(true);
+							result.set("Successfully renamed function '" + oldName + "' to '" + newName + "' at address " + address);
+							success = true;
 							break;
 						}
 					}
+					if (!success) {
+						result.set("Function '" + oldName + "' not found");
+					}
 				} catch (Exception e) {
 					Msg.error(this, "Error renaming function", e);
+					result.set("Error: " + e.getMessage());
 				} finally {
-					program.endTransaction(tx, successFlag.get());
+					program.endTransaction(tx, success);
 				}
 			});
 		} catch (InterruptedException | InvocationTargetException e) {
 			Msg.error(this, "Failed to execute rename on Swing thread", e);
+			return "Error: " + e.getMessage();
 		}
-		return successFlag.get();
+		return result.get();
 	}
 
-	private void renameDataAtAddress(String addressStr, String newName) {
+	private String renameDataAtAddress(String addressStr, String newName) {
 		Program program = getCurrentProgram();
-		if (program == null) return;
+		if (program == null) return "No program loaded";
 
+		AtomicReference<String> result = new AtomicReference<>("Rename data failed");
 		try {
 			SwingUtilities.invokeAndWait(() -> {
 				int tx = program.startTransaction("Rename data");
+				boolean success = false;
 				try {
 					Address addr = program.getAddressFactory().getAddress(addressStr);
+					if (addr == null) {
+						result.set("Invalid address: " + addressStr);
+						return;
+					}
 					Listing listing = program.getListing();
 					Data data = listing.getDefinedDataAt(addr);
 					if (data != null) {
+						String oldName = data.getLabel();
 						SymbolTable symTable = program.getSymbolTable();
 						Symbol symbol = symTable.getPrimarySymbol(addr);
 						if (symbol != null) {
@@ -840,16 +942,23 @@ public class GhidraMCPPlugin extends Plugin {
 						} else {
 							symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
 						}
+						result.set("Successfully renamed data at " + addressStr + (oldName != null ? " ('" + oldName + "')" : "") + " to '" + newName + "'");
+						success = true;
+					} else {
+						result.set("No data found at address " + addressStr);
 					}
 				} catch (Exception e) {
 					Msg.error(this, "Rename data error", e);
+					result.set("Error: " + e.getMessage());
 				} finally {
-					program.endTransaction(tx, true);
+					program.endTransaction(tx, success);
 				}
 			});
 		} catch (InterruptedException | InvocationTargetException e) {
 			Msg.error(this, "Failed to execute rename data on Swing thread", e);
+			return "Error: " + e.getMessage();
 		}
+		return result.get();
 	}
 
 	private String renameVariableInFunction(String functionName, String oldVarName, String newVarName) {
@@ -901,7 +1010,7 @@ public class GhidraMCPPlugin extends Plugin {
 		}
 
 		if (highSymbol == null) {
-			return "Variable not found";
+			return "Variable '" + oldVarName + "' not found in function '" + functionName + "'";
 		}
 
 		boolean commitRequired = checkFullCommit(highSymbol, highFunction);
@@ -936,7 +1045,9 @@ public class GhidraMCPPlugin extends Plugin {
 			Msg.error(this, errorMsg, e);
 			return errorMsg;
 		}
-		return successFlag.get() ? "Variable renamed" : "Failed to rename variable";
+		return successFlag.get() 
+			? "Successfully renamed variable '" + oldVarName + "' to '" + newVarName + "' in function '" + functionName + "'" 
+			: "Failed to rename variable '" + oldVarName + "' in function '" + functionName + "'";
 	}
 
 	/**
