@@ -34,6 +34,7 @@ import javax.swing.*;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.net.URLDecoder;
@@ -239,6 +240,12 @@ public class GhidraMCPPlugin extends Plugin {
 				params.get("fieldName"),
 				params.get("comment")
 			);
+			sendResponse(exchange, response);
+		});
+
+		server.createContext("/extractCppStruct", exchange -> {
+			Map<String, String> params = parsePostParams(exchange);
+			String response = extractCppStruct(params.get("className"), params.get("namespace"));
 			sendResponse(exchange, response);
 		});
 
@@ -719,6 +726,38 @@ public class GhidraMCPPlugin extends Plugin {
 			return "Error: " + e.getMessage();
 		}
 		return result.get();
+	}
+
+	private String extractCppStruct(String className, String namespace) {
+		if (className == null || className.isBlank()) {
+			return "Error: className is required";
+		}
+		if (namespace == null || namespace.isBlank()) {
+			return "Error: namespace is required";
+		}
+
+		for (Plugin plugin : tool.getManagedPlugins()) {
+			if (!"net.Preagonal.ExtractCPPStructPlugin".equals(plugin.getClass().getName())) {
+				continue;
+			}
+			try {
+				Method method =
+					plugin.getClass().getMethod("generateHeaderText", String.class, String.class);
+				Object result = method.invoke(plugin, className, namespace);
+				return Objects.toString(result, "");
+			}
+			catch (InvocationTargetException e) {
+				Throwable cause = e.getCause();
+				String message = cause != null ? cause.getMessage() : e.getMessage();
+				return "Error: " + message;
+			}
+			catch (ReflectiveOperationException e) {
+				Msg.error(this, "Failed to call ExtractCPPStruct", e);
+				return "Error: ExtractCPPStruct is available but does not expose generateHeaderText";
+			}
+		}
+
+		return "Error: ExtractCPPStruct plugin is not loaded";
 	}
 
 	private boolean matchesDataTypeKind(DataType dataType, String kind) {

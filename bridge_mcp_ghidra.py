@@ -41,6 +41,7 @@ ENDPOINTS = {
     "rename_data_type": "renameDataType",
     "create_structure": "createStructure",
     "set_structure_field": "setStructureField",
+    "extract_cpp_struct": "extractCppStruct",
     "search_functions": "searchFunctions",
 }
 
@@ -221,6 +222,16 @@ def set_structure_field(struct_name: str, offset: int, field_type: str, field_na
         "fieldType": field_type,
         "fieldName": field_name,
         "comment": comment,
+    })
+
+@mcp.tool()
+def extract_cpp_struct(class_name: str, namespace: str) -> str:
+    """
+    Generate a C++ class header with ExtractCPPStruct and return it as text.
+    """
+    return safe_post(ENDPOINTS["extract_cpp_struct"], {
+        "className": class_name,
+        "namespace": namespace,
     })
 
 @mcp.tool()
